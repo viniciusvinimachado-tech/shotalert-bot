@@ -3,6 +3,7 @@ import json
 import logging
 import requests
 import time
+import re
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request
 from telegram import Bot, Update
@@ -57,7 +58,7 @@ _cache = carregar_cache()
 
 def cache_get(key):
     item = _cache.get(key)
-    if item and time.time() - item["time"] < 3600:
+    if item and time.time() - item["time"] < 21600: # 6h cache pra stats
         return item["data"]
     return None
 
@@ -74,10 +75,7 @@ def fd_request(endpoint):
             logging.warning("Rate limit FD. Aguardando 60s")
             time.sleep(60)
             return fd_request(endpoint)
-        data = resp.json()
-        if data.get("errorCode"):
-            logging.error(f"FD ERR {endpoint}: {data.get('message')}")
-        return data
+        return resp.json()
     except Exception as e:
         logging.error(f"Exception FD {endpoint}: {e}")
         return {}
@@ -93,74 +91,108 @@ def buscar_jogos_data(data_str, comp_id):
     result = data.get("matches", [])
     logging.info(f"FD {comp_id} {data_str}: {len(result)} jogos")
     cache_set(key, result)
-    time.sleep(6) # 10 req/min free
+    time.sleep(6)
     return result
 
 # ─── SOFASCORE STATS ──────────────────────────────────────────────────────────
-def buscar_id_sofascore(time_casa, time_fora, data_str):
-    key = f"sofa_id_{time_casa}_{time_fora}_{data_str}"
+def limpar_nome_time(nome):
+    nome = nome.lower()
+    nome = re.sub(r'\b(fc|ec|sc|ac|cf|if|fk|bk|sk|bk|afc|ca|cr|se)\b', '', nome)
+    nome = re.sub(r'[^a-z0-9 ]', '', nome)
+    return nome.strip()
+
+def buscar_time_sofascore(nome_time):
+    key = f"sofa_team_{nome_time}"
     cached = cache_get(key)
     if cached: return cached
 
     try:
-        url = f"{SOFASCORE_BASE}/sport/football/scheduled-events/{data_str}"
+        url = f"{SOFASCORE_BASE}/search/teams/{nome_time}"
         resp = SOFASCORE_SESSION.get(url, timeout=10)
-        eventos = resp.json().get("events", [])
-        for e in eventos:
-            if (time_casa.lower() in e["homeTeam"]["name"].lower() or
-                e["homeTeam"]["name"].lower() in time_casa.lower()) and \
-               (time_fora.lower() in e["awayTeam"]["name"].lower() or
-                e["awayTeam"]["name"].lower() in time_fora.lower()):
-                cache_set(key, e["id"])
-                return e["id"]
+        results = resp.json().get("results", [])
+        if results:
+            team_id = results[0]["entity"]["id"]
+            cache_set(key, team_id)
+            return team_id
     except Exception as e:
-        logging.error(f"Sofascore ID ERR: {e}")
+        logging.error(f"Sofascore search team ERR {nome_time}: {e}")
     return None
 
-def buscar_stats_sofascore(match_fd):
-    casa = match_fd["homeTeam"]["name"]
-    fora = match_fd["awayTeam"]["name"]
-    data_str = match_fd["utcDate"][:10]
-
-    key = f"stats_{casa}_{fora}_{data_str}"
+def buscar_media_stats_time(nome_time):
+    key = f"stats_avg_{nome_time}"
     cached = cache_get(key)
     if cached: return cached
 
-    match_id = buscar_id_sofascore(casa, fora, data_str)
-    if not match_id:
-        return {"media": 0, "media_alvo": 0, "jogos": 0}
+    team_id = buscar_time_sofascore(nome_time)
+    if not team_id:
+        return {"media_shots": 0, "media_sot": 0, "jogos": 0}
 
     try:
-        url = f"{SOFASCORE_BASE}/event/{match_id}/statistics"
+        url = f"{SOFASCORE_BASE}/team/{team_id}/events/last/0"
         resp = SOFASCORE_SESSION.get(url, timeout=10)
-        stats = resp.json()
+        events = resp.json().get("events", [])[:5] # Últimos 5 jogos
 
-        shots_casa = shots_fora = 0
-        sot_casa = sot_fora = 0
+        total_shots = total_sot = jogos_validos = 0
 
-        for group in stats.get("statistics", []):
-            if group["period"] == "ALL":
-                for stat_group in group.get("groups", []):
-                    for stat in stat_group.get("statisticsItems", []):
-                        if stat["name"] == "Total shots":
-                            shots_casa = int(stat["home"])
-                            shots_fora = int(stat["away"])
-                        if stat["name"] == "Shots on target":
-                            sot_casa = int(stat["home"])
-                            sot_fora = int(stat["away"])
+        for event in events:
+            if event["status"]["type"]!= "finished": continue
+            event_id = event["id"]
 
-        resultado = {
-            "media": shots_casa + shots_fora,
-            "media_alvo": sot_casa + sot_fora,
-            "jogos": 1
-        }
+            url_stats = f"{SOFASCORE_BASE}/event/{event_id}/statistics"
+            resp_stats = SOFASCORE_SESSION.get(url_stats, timeout=10)
+            stats = resp_stats.json()
+
+            is_home = event["homeTeam"]["id"] == team_id
+
+            for group in stats.get("statistics", []):
+                if group["period"] == "ALL":
+                    for stat_group in group.get("groups", []):
+                        for stat in stat_group.get("statisticsItems", []):
+                            if stat["name"] == "Total shots":
+                                shots = int(stat["home"] if is_home else stat["away"] or 0)
+                                total_shots += shots
+                            if stat["name"] == "Shots on target":
+                                sot = int(stat["home"] if is_home else stat["away"] or 0)
+                                total_sot += sot
+            jogos_validos += 1
+            time.sleep(1) # Evita ban
+
+        if jogos_validos > 0:
+            resultado = {
+                "media_shots": round(total_shots / jogos_validos, 1),
+                "media_sot": round(total_sot / jogos_validos, 1),
+                "jogos": jogos_validos
+            }
+        else:
+            resultado = {"media_shots": 0, "media_sot": 0, "jogos": 0}
+
         cache_set(key, resultado)
+        logging.info(f"Stats {nome_time}: {resultado}")
         return resultado
     except Exception as e:
-        logging.error(f"Sofascore Stats ERR: {e}")
-        return {"media": 0, "media_alvo": 0, "jogos": 0}
+        logging.error(f"Sofascore stats avg ERR {nome_time}: {e}")
+        return {"media_shots": 0, "media_sot": 0, "jogos": 0}
 
-# ─── ANÁLISE ──────────────────────────────────────────────────────────────────
+def analisar_confronto(match):
+    casa = match["homeTeam"]["name"]
+    fora = match["awayTeam"]["name"]
+
+    stats_casa = buscar_media_stats_time(casa)
+    stats_fora = buscar_media_stats_time(fora)
+
+    media_combinada = stats_casa["media_shots"] + stats_fora["media_shots"]
+    media_sot_combinada = stats_casa["media_sot"] + stats_fora["media_sot"]
+
+    return {
+        "media_shots": round(media_combinada, 1),
+        "media_sot": round(media_sot_combinada, 1),
+        "casa_shots": stats_casa["media_shots"],
+        "fora_shots": stats_fora["media_shots"],
+        "jogos_casa": stats_casa["jogos"],
+        "jogos_fora": stats_fora["jogos"]
+    }
+
+# ─── FORMATADORES ─────────────────────────────────────────────────────────────
 def formatar_alerta(match):
     casa = match["homeTeam"]["name"]
     fora = match["awayTeam"]["name"]
@@ -171,9 +203,8 @@ def formatar_alerta(match):
     hora_brt_str = hora_brt.strftime("%H:%M")
     data_str = hora_brt.strftime("%d/%m")
 
-    stats = buscar_stats_sofascore(match)
-    media_shots = stats["media"]
-    media_sot = stats["media_alvo"]
+    stats = analisar_confronto(match)
+    media_shots = stats["media_shots"]
 
     if media_shots >= 25:
         nivel = "🚨🔥 JOGO EXPLOSIVO"
@@ -187,24 +218,26 @@ def formatar_alerta(match):
     msg = (
         f"{nivel}\n{'━' * 28}\n🏆 {liga}\n⚽ *{casa} x {fora}*\n"
         f"🕐 {data_str} às {hora_brt_str} BRT\n\n"
-        f"📊 *Últimos jogos:*\n"
-        f"• Finalizações: {media_shots if media_shots else 'N/A'}\n"
-        f"• No alvo: {media_sot if media_sot else 'N/A'}\n\n"
-        f"💰 *Mercado: Over Finalizações/Gols*"
+        f"📊 *Média Últimos 5 Jogos:*\n"
+        f"• Combinada: {media_shots} finalizações\n"
+        f"• No alvo: {stats['media_sot']}\n"
+        f"• {casa}: {stats['casa_shots']} ({stats['jogos_casa']}j)\n"
+        f"• {fora}: {stats['fora_shots']} ({stats['jogos_fora']}j)\n\n"
+        f"💰 *Mercado: Over Finalizações*"
     )
     return msg
 
 # ─── COMANDOS ─────────────────────────────────────────────────────────────────
 def start(update, context):
     update.message.reply_text(
-        "🤖 *Shot Alert Bot v6.6*\n\n"
-        "🌍 9 ligas • 📊 Football-Data + Sofascore\n\n"
-        "/ping — Testar\n/jogos — Hoje\n/antecipados — 3 dias\n/alerta — Buscar quente\n/diagnostico — API",
+        "🤖 *Shot Alert Bot v6.7*\n\n"
+        "🌍 9 ligas • 📊 Média últimos 5 jogos\n\n"
+        "/ping — Testar\n/jogos — Hoje\n/antecipados — 3 dias\n/alerta — Jogos quentes\n/diagnostico — API",
         parse_mode="Markdown"
     )
 
 def ping(update, context):
-    update.message.reply_text("✅ Bot v6.6 online! FD + Sofascore")
+    update.message.reply_text("✅ Bot v6.7 online! Média Sofascore ativa")
 
 def diagnostico(update, context):
     update.message.reply_text("🔬 Testando APIs...")
@@ -242,36 +275,36 @@ def jogos(update, context):
         update.message.reply_text("📭 Nenhum jogo hoje.")
 
 def antecipados(update, context):
-    update.message.reply_text("📅 Buscando próximos 3 dias...")
+    update.message.reply_text("📅 Analisando próximos 3 dias... Demora 30s por jogo")
     hoje = datetime.now(timezone.utc).date()
     encontrou = False
     for dias in range(1, 4):
         data_str = (hoje + timedelta(days=dias)).strftime("%Y-%m-%d")
         for nome_liga, info in LIGAS.items():
             matches = buscar_jogos_data(data_str, info["id"])
-            for m in matches:
+            for m in matches[:3]: # Limita 3 por liga pra não demorar
                 encontrou = True
                 msg = formatar_alerta(m)
                 update.message.reply_text(msg, parse_mode="Markdown")
-                time.sleep(2) # Evita spam no Telegram
+                time.sleep(3)
     if not encontrou:
         update.message.reply_text("📭 Nenhuma partida nos próximos 3 dias.")
 
 def alerta(update, context):
-    update.message.reply_text("🔥 Buscando jogos quentes hoje...")
+    update.message.reply_text("🔥 Buscando jogos quentes... Pode demorar 1min")
     hoje = datetime.now(timezone.utc).date().strftime("%Y-%m-%d")
     quente = False
     for nome_liga, info in LIGAS.items():
         matches = buscar_jogos_data(hoje, info["id"])
         for m in matches:
-            stats = buscar_stats_sofascore(m)
-            if stats["media"] >= 18: # Filtro: 18+ finalizações
+            stats = analisar_confronto(m)
+            if stats["media_shots"] >= 18:
                 quente = True
                 msg = formatar_alerta(m)
                 update.message.reply_text(msg, parse_mode="Markdown")
-                time.sleep(2)
+                time.sleep(3)
     if not quente:
-        update.message.reply_text("😴 Nenhum jogo quente hoje. Usa /jogos pra ver todos.")
+        update.message.reply_text("😴 Nenhum jogo com 18+ finalizações hoje.")
 
 # ─── FLASK + WEBHOOK ──────────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -293,7 +326,7 @@ def webhook():
 
 @app.route('/')
 def index():
-    return 'Bot v6.6 FD+Sofascore Online'
+    return 'Bot v6.7 FD+Sofascore Online'
 
 @app.route('/health')
 def health():
